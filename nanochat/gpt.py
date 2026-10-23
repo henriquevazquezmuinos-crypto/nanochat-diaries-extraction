@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -81,7 +82,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_capture=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -105,7 +106,12 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
+        if attn_capture is not None:
+            # Introspection (replay) path: explicit attention that materializes the softmax weights.
+            # Mathematically the same as flash_attn_func below, but not used in training/generation.
+            assert kv_cache is None, "attention capture only supports full-sequence forwards (no kv_cache)"
+            y = self._attention_with_capture(q, k, v, window_size, attn_capture)
+        elif kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
@@ -127,6 +133,28 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+    def _attention_with_capture(self, q, k, v, window_size, attn_capture):
+        """
+        Explicit causal (optionally sliding-window) attention. q: (B,T,H,D), k/v: (B,T,Hkv,D).
+        Appends the softmax weights, shape (B, H, T, T) in fp32 (GQA expanded to query heads), to attn_capture.
+        Returns y of shape (B, T, H, D) in v's dtype.
+        """
+        B, T, H, D = q.shape
+        rep = self.n_head // self.n_kv_head
+        qh = q.transpose(1, 2).float()                                # (B, H, T, D)
+        kh = k.transpose(1, 2).float().repeat_interleave(rep, dim=1)  # (B, H, T, D)
+        vh = v.transpose(1, 2).repeat_interleave(rep, dim=1)          # (B, H, T, D)
+        scores = (qh @ kh.transpose(-1, -2)) / math.sqrt(D)           # q, k already carry the 1.2 scale each
+        qi = torch.arange(T, device=q.device).unsqueeze(1)
+        kj = torch.arange(T, device=q.device).unsqueeze(0)
+        mask = kj <= qi
+        if window_size[0] >= 0:
+            mask = mask & ((qi - kj) <= window_size[0])
+        att = torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)  # (B, H, T, T) fp32
+        attn_capture.append(att)
+        y = att.to(vh.dtype) @ vh                                     # (B, H, T, D)
+        return y.transpose(1, 2)                                      # (B, T, H, D)
+
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -147,8 +175,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attn_capture=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, attn_capture)
         x = x + self.mlp(norm(x))
         return x
 
@@ -456,7 +484,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', attn_capture=None):
+        # attn_capture: optional list; if given, each layer appends its (B, H, T, T) attention weights (replay/introspection only)
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -499,7 +528,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, attn_capture)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

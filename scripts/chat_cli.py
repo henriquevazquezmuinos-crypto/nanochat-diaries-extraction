@@ -5,10 +5,13 @@ Intended to be run single GPU only atm:
 python -m scripts.chat_cli
 """
 import argparse
+import os
+import time
 import torch
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
+from nanochat.attn_dump import save_internals
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
@@ -17,6 +20,8 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
+parser.add_argument('--save-internals', action='store_true', help='Save attention (.attn.bin) and logit probabilities (logits.json) for the conversation on exit/clear')
+parser.add_argument('--internals-dir', type=str, default='logs/internals', help='Base directory for saved internals (a timestamped subdir is created per conversation)')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 args = parser.parse_args()
 
@@ -38,9 +43,20 @@ print("\nNanoChat Interactive Mode")
 print("-" * 50)
 print("Type 'quit' or 'exit' to end the conversation")
 print("Type 'clear' to start a new conversation")
+print("Type 'internals on' / 'internals off' to toggle saving model internals (attention, logit probs)")
 print("-" * 50)
 
 conversation_tokens = [bos]
+assistant_ranges = [] # inclusive (start, end) index ranges of assistant tokens inside conversation_tokens
+save_internals_enabled = args.save_internals
+
+def flush_internals():
+    """Replay the conversation and save its internals (if enabled and there is something to save)."""
+    if not save_internals_enabled or not assistant_ranges:
+        return
+    out_dir = os.path.join(args.internals_dir, time.strftime("%Y%m%d_%H%M%S"))
+    paths = save_internals(model, conversation_tokens, assistant_ranges, out_dir, tokenizer=tokenizer)
+    print(f"Saved model internals to {out_dir} ({', '.join(os.path.basename(p) for p in paths)})")
 
 while True:
 
@@ -52,17 +68,26 @@ while True:
         try:
             user_input = input("\nUser: ").strip()
         except (EOFError, KeyboardInterrupt):
+            flush_internals()
             print("\nGoodbye!")
             break
 
     # Handle special commands
     if user_input.lower() in ['quit', 'exit']:
+        flush_internals()
         print("Goodbye!")
         break
 
     if user_input.lower() == 'clear':
+        flush_internals()
         conversation_tokens = [bos]
+        assistant_ranges = []
         print("Conversation cleared.")
+        continue
+
+    if user_input.lower() in ['internals on', 'internals off']:
+        save_internals_enabled = user_input.lower().endswith('on')
+        print(f"Saving model internals: {'on' if save_internals_enabled else 'off'}")
         continue
 
     if not user_input:
@@ -75,6 +100,7 @@ while True:
 
     # Kick off the assistant
     conversation_tokens.append(assistant_start)
+    assistant_begin = len(conversation_tokens) - 1
     generate_kwargs = {
         "num_samples": 1,
         "max_tokens": 256,
@@ -94,7 +120,9 @@ while True:
     if response_tokens[-1] != assistant_end:
         response_tokens.append(assistant_end)
     conversation_tokens.extend(response_tokens)
+    assistant_ranges.append((assistant_begin, len(conversation_tokens) - 1))
 
     # In the prompt mode, we only want a single response and exit
     if args.prompt:
+        flush_internals()
         break
