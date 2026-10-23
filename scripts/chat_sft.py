@@ -18,7 +18,7 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, make_checkpoint_fractions
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -61,6 +61,12 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
+# Checkpoint schedule (final checkpoint is always saved). SFT length may be dataset-driven, so these are fractions of progress.
+parser.add_argument("--num-checkpoints", type=int, default=0, help="save N checkpoints over SFT, including the final one (0 = only final)")
+parser.add_argument("--checkpoint-spacing", type=str, default="linear", choices=["log", "linear", "sqrt"], help="spacing of --num-checkpoints")
+parser.add_argument("--checkpoint-min-frac", type=float, default=0.01, help="first scheduled checkpoint at this fraction of SFT (log/sqrt spacing)")
+parser.add_argument("--checkpoint-fracs", type=str, default="", help="comma-separated fractions of SFT progress to checkpoint at, e.g. 0.25,0.5")
+parser.add_argument("--checkpoint-optim", action="store_true", help="also save optimizer state at intermediate checkpoints (large)")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
@@ -323,6 +329,13 @@ def get_muon_momentum(it):
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = None # set at the first eval
+# Fractions of progress at which to save intermediate checkpoints (the final one is saved at last_step)
+pending_checkpoint_fracs = [f for f in make_checkpoint_fractions(
+    args.num_checkpoints, spacing=args.checkpoint_spacing, min_frac=args.checkpoint_min_frac,
+    fracs=[float(f) for f in args.checkpoint_fracs.split(",") if f.strip()]) if f < 1.0]
+if pending_checkpoint_fracs:
+    print0(f"Intermediate checkpoints at SFT progress: {[round(f, 3) for f in pending_checkpoint_fracs]}")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -335,6 +348,16 @@ while True:
         last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
+
+    # Scheduled intermediate checkpoint? Decision is synchronized across ranks since every rank saves a shard.
+    save_now = False
+    while pending_checkpoint_fracs and progress >= pending_checkpoint_fracs[0]:
+        pending_checkpoint_fracs.pop(0)
+        save_now = step > 0
+    if ddp:
+        save_now_tensor = torch.tensor(save_now, dtype=torch.int32, device=device)
+        dist.all_reduce(save_now_tensor, op=dist.ReduceOp.MAX)
+        save_now = bool(save_now_tensor.item())
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
@@ -388,15 +411,15 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
+    # save checkpoint at the end of the run or at scheduled points (all ranks participate so each saves its optimizer shard)
+    if last_step or save_now:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(),
-            optimizer.state_dict(),
+            optimizer.state_dict() if (last_step or args.checkpoint_optim) else None, # skip optimizer state for intermediate checkpoints
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step

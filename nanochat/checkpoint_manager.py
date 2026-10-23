@@ -57,6 +57,109 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
+def make_checkpoint_schedule(
+    num_iterations,
+    num_checkpoints=0,
+    spacing="log",
+    min_frac=0.01,
+    steps=None,
+    fracs=None,
+    every=-1,
+    include_init=False,
+    include_last=True,
+    multiple_of=1,
+):
+    """
+    Decide at which training steps to save checkpoints. Returns a sorted list of unique ints.
+    Sources are combined (union), so any mix of them works:
+
+    - num_checkpoints + spacing: N checkpoints spread over [min_frac*T, T] where T = num_iterations
+        spacing="log"    : geometric spacing (dense early when the model changes fastest). Default.
+        spacing="linear" : evenly spaced.
+        spacing="sqrt"   : in between linear and log.
+    - steps: explicit absolute step numbers, e.g. [100, 1000, 5000]
+    - fracs: explicit fractions of training in (0, 1], e.g. [0.1, 0.5, 0.9]
+    - every: a checkpoint every N steps (-1 = disable)
+    - include_init: also save step 0 (random init baseline)
+    - include_last: always include the final step (num_iterations)
+    - multiple_of: snap steps to a multiple of this (e.g. eval_every), never below 1 or above T
+
+    Steps outside [0, T] are dropped. Step 0 only appears if include_init=True.
+    """
+    T = num_iterations
+    assert T > 0, "num_iterations must be positive"
+    assert spacing in ("log", "linear", "sqrt"), f"unknown spacing {spacing!r}"
+    assert 0 < min_frac <= 1, "min_frac must be in (0, 1]"
+    out = set()
+
+    n = num_checkpoints
+    if n > 0:
+        lo = min_frac * T
+        if n == 1:
+            points = [float(T)]
+        elif spacing == "linear":
+            # evenly spaced and ending at T; min_frac is ignored here (start at T/n)
+            points = [T * (i + 1) / n for i in range(n)]
+        elif spacing == "log":
+            ratio = (T / lo) ** (1.0 / (n - 1))
+            points = [lo * ratio**i for i in range(n)]
+        else: # sqrt
+            a, b = lo**0.5, T**0.5
+            points = [(a + (b - a) * i / (n - 1)) ** 2 for i in range(n)]
+        out.update(round(p) for p in points)
+
+    if steps:
+        out.update(int(s) for s in steps)
+    if fracs:
+        assert all(0 < f <= 1 for f in fracs), "fracs must be in (0, 1]"
+        out.update(round(f * T) for f in fracs)
+    if every and every > 0:
+        out.update(range(every, T + 1, every))
+
+    if multiple_of > 1:
+        out = {max(multiple_of, round(s / multiple_of) * multiple_of) for s in out if s > 0}
+        out = {min(s, T) for s in out}
+
+    if include_last:
+        out.add(T)
+    if include_init:
+        out.add(0)
+    return sorted(s for s in out if (s >= 1 or (s == 0 and include_init)) and s <= T)
+
+
+def make_checkpoint_fractions(num_checkpoints=0, spacing="linear", min_frac=0.01, fracs=None, include_last=True):
+    """
+    Like make_checkpoint_schedule, but for stages whose total length isn't known in advance
+    (e.g. SFT with dataset-driven stopping). Returns sorted fractions of training progress in (0, 1].
+    The caller saves when its progress counter first crosses each fraction.
+    """
+    N = 1_000_000 # fine-grained virtual horizon, fractions are step/N
+    steps = make_checkpoint_schedule(N, num_checkpoints, spacing=spacing, min_frac=min_frac,
+                                     fracs=fracs, include_last=include_last)
+    return [s / N for s in steps]
+
+
+def split_checkpoint_budget(total, weights=None):
+    """
+    Split a total checkpoint budget across training stages so that the sum is exactly `total`
+    and every stage gets at least 1 (its final model). Returns a dict stage -> count.
+    Default weights favor pretraining (where the curve is richest), then SFT, then RL.
+    E.g. total=8 -> {base: 5, sft: 2, rl: 1}; total=6 -> {base: 4, sft: 1, rl: 1}.
+    """
+    weights = weights or {"base": 0.6, "sft": 0.25, "rl": 0.15}
+    assert total >= len(weights), f"need at least {len(weights)} checkpoints (one per stage)"
+    wsum = sum(weights.values())
+    ideal = {k: total * w / wsum for k, w in weights.items()}
+    counts = {k: max(1, int(v)) for k, v in ideal.items()}
+    while sum(counts.values()) < total: # give leftovers to the stage with the largest fractional remainder
+        k = max(counts, key=lambda k: ideal[k] - counts[k])
+        counts[k] += 1
+    while sum(counts.values()) > total: # take back from the stage that is most over its ideal share
+        k = max((k for k in counts if counts[k] > 1), key=lambda k: counts[k] - ideal[k])
+        counts[k] -= 1
+    return counts
+
+
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")

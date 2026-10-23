@@ -23,7 +23,7 @@ import wandb
 import torch
 import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.checkpoint_manager import save_checkpoint, load_model, make_checkpoint_schedule
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
@@ -56,7 +56,13 @@ parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
-parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps (ignored if a checkpoint schedule below is given)")
+# Checkpoint schedule (final checkpoint is always saved; replaces --save-every when used)
+parser.add_argument("--num-checkpoints", type=int, default=0, help="save N checkpoints over RL, including the final one (0 = disable, use --save-every)")
+parser.add_argument("--checkpoint-spacing", type=str, default="linear", choices=["log", "linear", "sqrt"], help="spacing of --num-checkpoints")
+parser.add_argument("--checkpoint-min-frac", type=float, default=0.01, help="first scheduled checkpoint at this fraction of RL (log/sqrt spacing)")
+parser.add_argument("--checkpoint-steps", type=str, default="", help="comma-separated absolute steps to checkpoint at")
+parser.add_argument("--checkpoint-fracs", type=str, default="", help="comma-separated fractions of RL to checkpoint at, e.g. 0.5")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -81,6 +87,19 @@ train_task = GSM8K(subset="main", split="train")
 val_task = GSM8K(subset="main", split="test")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
+use_checkpoint_schedule = args.num_checkpoints > 0 or bool(args.checkpoint_steps) or bool(args.checkpoint_fracs)
+scheduled_checkpoint_steps = set()
+if use_checkpoint_schedule:
+    # the last step index is num_steps - 1, which is always saved
+    scheduled_checkpoint_steps = set(make_checkpoint_schedule(
+        max(1, num_steps - 1),
+        num_checkpoints=args.num_checkpoints,
+        spacing=args.checkpoint_spacing,
+        min_frac=args.checkpoint_min_frac,
+        steps=[int(x) for x in args.checkpoint_steps.split(",") if x.strip()],
+        fracs=[float(x) for x in args.checkpoint_fracs.split(",") if x.strip()],
+    ))
+    print0(f"Scheduled checkpoints at steps: {sorted(scheduled_checkpoint_steps)}")
 
 @torch.no_grad()
 def get_batch():
@@ -305,7 +324,11 @@ for step in range(num_steps):
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
-    if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
+    if use_checkpoint_schedule:
+        should_save = step in scheduled_checkpoint_steps or step == num_steps - 1
+    else:
+        should_save = (step > 0 and step % args.save_every == 0) or step == num_steps - 1
+    if master_process and should_save:
         base_dir = get_base_dir()
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model

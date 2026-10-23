@@ -29,7 +29,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, make_checkpoint_schedule
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -75,6 +75,15 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Checkpoint schedule (for studying how capabilities develop during training)
+parser.add_argument("--num-checkpoints", type=int, default=0, help="save N checkpoints spread over training, spaced by --checkpoint-spacing (0 = disable)")
+parser.add_argument("--checkpoint-spacing", type=str, default="log", choices=["log", "linear", "sqrt"], help="spacing of --num-checkpoints")
+parser.add_argument("--checkpoint-min-frac", type=float, default=0.01, help="first scheduled checkpoint at this fraction of training (log/sqrt spacing)")
+parser.add_argument("--checkpoint-steps", type=str, default="", help="comma-separated absolute steps to checkpoint at, e.g. 100,1000,5000")
+parser.add_argument("--checkpoint-fracs", type=str, default="", help="comma-separated fractions of training to checkpoint at, e.g. 0.1,0.5,0.9")
+parser.add_argument("--checkpoint-include-init", action="store_true", help="also save step 0 (random init baseline)")
+parser.add_argument("--checkpoint-multiple-of", type=int, default=1, help="snap scheduled steps to a multiple of this")
+parser.add_argument("--checkpoint-optim", action="store_true", help="also save optimizer state at scheduled intermediate checkpoints (needed to resume; large)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -351,6 +360,18 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
+scheduled_checkpoint_steps = set(make_checkpoint_schedule(
+    num_iterations,
+    num_checkpoints=args.num_checkpoints,
+    spacing=args.checkpoint_spacing,
+    min_frac=args.checkpoint_min_frac,
+    steps=[int(s) for s in args.checkpoint_steps.split(",") if s.strip()],
+    fracs=[float(f) for f in args.checkpoint_fracs.split(",") if f.strip()],
+    include_init=args.checkpoint_include_init,
+    multiple_of=args.checkpoint_multiple_of,
+)) if (args.num_checkpoints > 0 or args.checkpoint_steps or args.checkpoint_fracs or args.checkpoint_include_init) else set()
+if scheduled_checkpoint_steps:
+    print0(f"Scheduled checkpoints at steps: {sorted(scheduled_checkpoint_steps)}")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
@@ -474,12 +495,16 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    is_periodic_save = step > 0 and args.save_every > 0 and step % args.save_every == 0
+    is_scheduled_save = step in scheduled_checkpoint_steps
+    if last_step or (step != args.resume_from_step and (is_periodic_save or is_scheduled_save)):
+        # Scheduled-only intermediate checkpoints skip the (large) optimizer state unless asked for.
+        save_optim = last_step or is_periodic_save or args.checkpoint_optim
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            optimizer.state_dict() if save_optim else None, # optimizer state
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
